@@ -1,50 +1,25 @@
 #!/bin/bash
-
-function now() {
-  date +"%m-%d-%Y %H-%M"
-}
-
-echo "$(now): backup-all-indexes.sh - Verifying required environment variables"
-
-: ${DATABASE_URL:?"Error: DATABASE_URL environment variable not set"}
-: ${S3_BUCKET:?"Error: S3_BUCKET environment variable not set"}
-: ${S3_ACCESS_KEY_ID:?"Error: S3_ACCESS_KEY_ID environment variable not set"}
-: ${S3_SECRET_ACCESS_KEY:?"Error: S3_SECRET_ACCESS_KEY environment variable not set"}
-
-# Normalize DATABASE_URL by removing the trailing slash.
-DATABASE_URL="${DATABASE_URL%/}"
+# blieberman adpted from https://github.com/aptible/elasticsearch-logstash-s3-backup
 
 # Set some defaults
-S3_REGION=${S3_REGION:-us-east-1}
-REPOSITORY_NAME=${REPOSITORY_NAME:-logstash_snapshots}
+S3_ACCESS_KEY_ID=$(grep aws_access_key_id ~/.aws/credentials | awk '{ print $3 }')
+S3_SECRET_ACCESS_KEY=$(grep aws_secret_access_key ~/.aws/credentials | awk '{ print $3 }')
+S3_BUCKET=$YOUR_S3_BUCKET
+S3_BUCKET_BASE_PATH=$YOUR_S3_BUCKET_BASE_PATH
+S3_REGION=us-east-1
+ELASTICSEARCH_HOST=http://$YOUR_ELASTICSEARCH_HOST:9200
+REPOSITORY_NAME=logstash_snapshots
 WAIT_SECONDS=${WAIT_SECONDS:-1800}
-MAX_DAYS_TO_KEEP=${MAX_DAYS_TO_KEEP:-30}
-REPOSITORY_URL=${DATABASE_URL}/_snapshot/${REPOSITORY_NAME}
+MAX_DAYS_TO_KEEP=10
+REPOSITORY_URL="${ELASTICSEARCH_HOST}/_snapshot/${REPOSITORY_NAME}"
+REPOSITORY_PLUGIN=repository-s3
 
-# Ensure that we don't delete indices that are being logged. Using 1 should
-# actually be fine here as long as everyone's on the same timezone, but let's
-# be safe and require at least 2 days.
-if [[ "$MAX_DAYS_TO_KEEP" -lt 2 ]]; then
-  echo "$(now): MAX_DAYS_TO_KEEP must be an integer >= 2."
-  echo "$(now): Using lower values may break archiving."
-  exit 1
-fi
-
-ES_VERSION=$(curl -sS $DATABASE_URL?format=yaml | grep number | cut -d'"' -f2)
-ES_VERSION_COMPARED_TO_50=$(apk version -t "$ES_VERSION" "4.9")
-
-if [ $ES_VERSION_COMPARED_TO_50 = '<' ]; then
-    REPOSITORY_PLUGIN=cloud-aws
-else
-    REPOSITORY_PLUGIN=repository-s3
-fi
-
-backup_index ()
+function backup_index ()
 {
   : ${1:?"Error: expected index name passed as parameter"}
   local INDEX_NAME=$1
   local SNAPSHOT_URL=${REPOSITORY_URL}/${INDEX_NAME}
-  local INDEX_URL=${DATABASE_URL}/${INDEX_NAME}
+  local INDEX_URL=${ELASTICSEARCH_HOST}/${INDEX_NAME}
 
   grep -q SUCCESS <(curl -sS ${SNAPSHOT_URL})
   if [ $? -ne 0 ]; then
@@ -67,14 +42,46 @@ backup_index ()
   curl -w "\n" -sS -XDELETE ${INDEX_URL}
 }
 
+
+function now() {
+  date +"%m-%d-%Y %H-%M"
+}
+
+#####
+
+echo "$(now): es-index_snapshot_s3.sh -- Preparing for run..."
+
+# Ensure that we don't delete indices that are being logged. Using 1 should
+# actually be fine here as long as everyone's on the same timezone, but let's
+# be safe and require at least 2 days.
+if [[ "$MAX_DAYS_TO_KEEP" -lt 2 ]]; then
+  echo "$(now): MAX_DAYS_TO_KEEP must be an integer >= 2."
+  echo "$(now): Using lower values may break archiving."
+  exit 1
+fi
+
 # Ensure that Elasticsearch has the cloud-aws plugin.
-grep -q $REPOSITORY_PLUGIN <(curl -sS ${DATABASE_URL}/_cat/plugins)
+echo "$(now): Ensuring ${REPOSITORY_PLUGIN} exists @ ${ELASTICSEARCH_HOST}/_cat/plugins ..."
+grep -q $REPOSITORY_PLUGIN <(curl -sS ${ELASTICSEARCH_HOST}/_cat/plugins)
 if [ $? -ne 0 ]; then
   echo "$(now): Elasticsearch server does not have the ${REPOSITORY_PLUGIN} plugin installed. Exiting."
   exit 1
 fi
+echo "$(now): ...ensured plugins exist"
 
 echo "$(now): Ensuring Elasticsearch snapshot repository ${REPOSITORY_NAME} exists..."
+echo curl -w "\n" -sS -XPUT ${REPOSITORY_URL} -d "{
+  \"type\": \"s3\",
+  \"settings\": {
+    \"bucket\" : \"${S3_BUCKET}\",
+    \"base_path\": \"${S3_BUCKET_BASE_PATH}\",
+    \"access_key\": \"${S3_ACCESS_KEY_ID}\",
+    \"secret_key\": \"${S3_SECRET_ACCESS_KEY}\",
+    \"region\": \"${S3_REGION}\",
+    \"protocol\": \"https\",
+    \"server_side_encryption\": true
+  }
+}"
 curl -w "\n" -sS -XPUT ${REPOSITORY_URL} -d "{
   \"type\": \"s3\",
   \"settings\": {
@@ -87,12 +94,14 @@ curl -w "\n" -sS -XPUT ${REPOSITORY_URL} -d "{
     \"server_side_encryption\": true
   }
 }"
+echo "$(now): ...ensured repository exists"
 
 CUTOFF_DATE=$(date --date="${MAX_DAYS_TO_KEEP} days ago" +"%Y.%m.%d")
-echo "$(now) Archiving all indexes with logs before ${CUTOFF_DATE}."
-SUBSTITUTION='s/.*\(logstash-[0-9\.]\{10\}\).*/\1/'
-for index_name in $(curl -sS ${DATABASE_URL}/_cat/indices | grep logstash- | sed $SUBSTITUTION | sort); do
-  if [[ "${index_name:9}" < "${CUTOFF_DATE}" ]]; then
+SUBSTITUTION='s/.*\(log-prod-.*-[0-9\.]\{10\}\).*/\1/'
+echo "$(now): Archiving all indexes with logs before ${CUTOFF_DATE}..."
+
+for index_name in $(curl -sS ${ELASTICSEARCH_HOST}/_cat/indices | grep log-prod- | sed $SUBSTITUTION | sort); do
+  if [[ "${index_name: -10}" < "${CUTOFF_DATE}" ]]; then
     echo "$(now): Ensuring ${index_name} is archived..."
       backup_index ${index_name}
       if [ $? -eq 0 ]; then
